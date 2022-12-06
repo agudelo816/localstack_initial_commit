@@ -1,231 +1,233 @@
-from localstack import config
+import threading
+import traceback
+import os
+import hashlib
+import uuid
+import time
+import glob
+from datetime import datetime
+from multiprocessing.dummy import Pool
+from localstack.constants import *
 
-# TODO: remove imports from here (need to update any client code that imports these from utils.common)
-from localstack.utils.archives import get_unzipped_size, is_zip_file, untar, unzip  # noqa
+# arrays for temporary files and resources
+TMP_FILES = []
+TMP_THREADS = []
 
-# TODO: remove imports from here (need to update any client code that imports these from utils.common)
-from localstack.utils.collections import (  # noqa
-    DelSafeDict,
-    HashableList,
-    PaginatedList,
-    ensure_list,
-    is_list_or_tuple,
-    is_none_or_empty,
-    is_sub_dict,
-    items_equivalent,
-    last_index_of,
-    merge_dicts,
-    merge_recursive,
-    remove_attributes,
-    remove_none_values_from_dict,
-    rename_attributes,
-    select_attributes,
-    to_unique_items_list,
-)
+# cache clean variables
+CACHE_CLEAN_TIMEOUT = 60 * 5
+CACHE_MAX_AGE = 60 * 60
+CACHE_FILE_PATTERN = '/tmp/cache.*.json'
+last_cache_clean_time = {'time': 0}
+mutex_clean = threading.Semaphore(1)
+mutex_popen = threading.Semaphore(1)
 
-# TODO: remove imports from here (need to update any client code that imports these from utils.common)
-from localstack.utils.crypto import (  # noqa
-    PEM_CERT_END,
-    PEM_CERT_START,
-    PEM_KEY_END_REGEX,
-    PEM_KEY_START_REGEX,
-    generate_ssl_cert,
-)
-
-# TODO: remove imports from here (need to update any client code that imports these from utils.common)
-from localstack.utils.files import (  # noqa
-    TMP_FILES,
-    chmod_r,
-    chown_r,
-    cleanup_tmp_files,
-    cp_r,
-    disk_usage,
-    ensure_readable,
-    file_exists_not_empty,
-    get_or_create_file,
-    is_empty_dir,
-    load_file,
-    mkdir,
-    new_tmp_dir,
-    new_tmp_file,
-    replace_in_file,
-    rm_rf,
-    save_file,
-)
-
-# TODO: remove imports from here (need to update any client code that imports these from utils.common)
-from localstack.utils.functions import (  # noqa
-    call_safe,
-    empty_context_manager,
-    prevent_stack_overflow,
-    run_safe,
-)
-
-# TODO: remove imports from here (need to update any client code that imports these from utils.common)
-from localstack.utils.http import (  # noqa
-    NetrcBypassAuth,
-    _RequestsSafe,
-    download,
-    get_proxies,
-    make_http_request,
-    parse_request_data,
-    replace_response_content,
-    safe_requests,
-)
-
-# TODO: remove imports from here (need to update any client code that imports these from utils.common)
-from localstack.utils.json import (  # noqa
-    CustomEncoder,
-    FileMappedDocument,
-    assign_to_path,
-    canonical_json,
-    clone,
-    clone_safe,
-    extract_from_jsonpointer_path,
-    extract_jsonpath,
-    fix_json_keys,
-    json_safe,
-    parse_json_or_yaml,
-    try_json,
-)
-
-# TODO: remove imports from here (need to update any client code that imports these from utils.common)
-from localstack.utils.net import (  # noqa
-    PortNotAvailableException,
-    PortRange,
-    get_free_tcp_port,
-    is_ip_address,
-    is_ipv4_address,
-    is_port_open,
-    port_can_be_bound,
-    resolve_hostname,
-    wait_for_port_closed,
-    wait_for_port_open,
-    wait_for_port_status,
-)
-
-# TODO: remove imports from here (need to update any client code that imports these from utils.common)
-from localstack.utils.numbers import format_bytes, format_number, is_number  # noqa
-
-# TODO: remove imports from here (need to update any client code that imports these from utils.common)
-from localstack.utils.objects import (  # noqa
-    ArbitraryAccessObj,
-    Mock,
-    ObjectIdHashComparator,
-    SubtypesInstanceManager,
-    fully_qualified_class_name,
-    get_all_subclasses,
-    keys_to_lower,
-    not_none_or,
-    recurse_object,
-)
-
-# TODO: remove imports from here (need to update any client code that imports these from utils.common)
-from localstack.utils.platform import (  # noqa
-    get_arch,
-    get_os,
-    in_docker,
-    is_debian,
-    is_linux,
-    is_mac_os,
-    is_windows,
-)
-
-# TODO: remove imports from here (need to update any client code that imports these from utils.common)
-from localstack.utils.run import (  # noqa
-    CaptureOutput,
-    ShellCommandThread,
-    get_os_user,
-    is_command_available,
-    is_root,
-    kill_process_tree,
-    run,
-    run_for_max_seconds,
-)
-
-# TODO: remove imports from here (need to update any client code that imports these from utils.common)
-from localstack.utils.strings import (  # noqa
-    base64_to_hex,
-    camel_to_snake_case,
-    canonicalize_bool_to_str,
-    convert_to_printable_chars,
-    first_char_to_lower,
-    first_char_to_upper,
-    is_base64,
-    is_string,
-    is_string_or_bytes,
-    long_uid,
-    md5,
-    short_uid,
-    snake_to_camel_case,
-    str_insert,
-    str_remove,
-    str_startswith_ignore_case,
-    str_to_bool,
-    to_bytes,
-    to_str,
-    truncate,
-)
-
-# TODO: remove imports from here (need to update any client code that imports these from utils.common)
-from localstack.utils.sync import (  # noqa
-    poll_condition,
-    retry,
-    sleep_forever,
-    synchronized,
-    wait_until,
-)
-
-# TODO: remove imports from here (need to update any client code that imports these from utils.common)
-from localstack.utils.tail import FileListener  # noqa
-
-# TODO: remove imports from here (need to update any client code that imports these from utils.common)
-from localstack.utils.threads import (  # noqa
-    TMP_PROCESSES,
-    TMP_THREADS,
-    FuncThread,
-    cleanup_threads_and_processes,
-    parallelize,
-    start_thread,
-    start_worker_thread,
-)
-
-# TODO: remove imports from here (need to update any client code that imports these from utils.common)
-from localstack.utils.time import (  # noqa
-    TIMESTAMP_FORMAT,
-    TIMESTAMP_FORMAT_MICROS,
-    TIMESTAMP_FORMAT_TZ,
-    epoch_timestamp,
-    isoformat_milliseconds,
-    mktime,
-    now,
-    now_utc,
-    parse_timestamp,
-    timestamp,
-    timestamp_millis,
-)
-
-# TODO: remove imports from here (need to update any client code that imports these from utils.common)
-from localstack.utils.urls import path_from_url  # noqa
-
-# TODO: remove imports from here (need to update any client code that imports these from utils.common)
-from localstack.utils.xml import obj_to_xml, strip_xmlns  # noqa
+# misc. constants
+TIMESTAMP_FORMAT = '%Y-%m-%dT%H:%M:%S'
 
 
-# TODO: move somewhere sensible (probably localstack.runtime)
-class ExternalServicePortsManager(PortRange):
-    """Manages the ports used for starting external services like ElasticSearch, OpenSearch,..."""
+class FuncThread (threading.Thread):
+    def __init__(self, func, params, quiet=False):
+        threading.Thread.__init__(self)
+        self.daemon = True
+        self.params = params
+        self.func = func
+        self.quiet = quiet
 
-    def __init__(self):
-        super().__init__(config.EXTERNAL_SERVICE_PORTS_START, config.EXTERNAL_SERVICE_PORTS_END)
+    def run(self):
+        try:
+            self.func(self.params)
+        except Exception, e:
+            if not self.quiet:
+                print("Thread run method %s(%s) failed: %s" %
+                    (self.func, self.params, traceback.format_exc(e)))
+
+    def stop(self, quiet=False):
+        if not quiet and not self.quiet:
+            print("WARN: not implemented: FuncThread.stop(..)")
 
 
-external_service_ports = ExternalServicePortsManager()
-"""The PortRange object of LocalStack's external service port range. This port range is by default exposed by the
-localstack container when starting via the CLI."""
+class ShellCommandThread (FuncThread):
+    def __init__(self, cmd, params={}):
+        self.cmd = cmd
+        self.process = None
+        FuncThread.__init__(self, self.run_cmd, params)
 
-# TODO: replace references with config.get_protocol/config.edge_ports_info
-get_service_protocol = config.get_protocol
+    def run_cmd(self, params):
+        self.process = run(self.cmd, async=True)
+        self.process.communicate()
 
-# TODO: replace references to safe_run with localstack.utils.run.run
-safe_run = run
+    def is_killed(self):
+        if not self.process:
+            return True
+        pid = self.process.pid
+        out = run("ps aux 2>&1 | grep '[^\s]*\s*%s\s' | grep -v grep |  grep ''" % pid)
+        return (not out)
+
+    def stop(self, quiet=False):
+        SIGINT = 2
+        SIGKILL = 9
+        if not self.process:
+            print("WARN: No process found for command '%s'" % self.cmd)
+            return
+        pid = self.process.pid
+        try:
+            os.kill(pid, SIGTERM)
+        except Exception, e:
+            if not quiet:
+                print('WARN: Unable to kill process with pid %s' % pid)
+        finally:
+            try:
+                os.kill(pid, SIGINT)
+            except Exception, e:
+                pass
+
+
+def is_string(s, include_unicode=True):
+    if isinstance(s, str):
+        return True
+    if include_unicode and isinstance(s, unicode):
+        return True
+    return False
+
+
+def md5(string):
+    m = hashlib.md5()
+    m.update(string)
+    return m.hexdigest()
+
+
+def timestamp(time=None, format=TIMESTAMP_FORMAT):
+    if not time:
+        time = datetime.utcnow()
+    if isinstance(time, (int, long, float)):
+        time = datetime.fromtimestamp(time)
+    return time.strftime(format)
+
+
+def now():
+    return time.mktime(datetime.utcnow().timetuple())
+
+
+def short_uid():
+    return str(uuid.uuid4())[0:8]
+
+
+def save_file(file, content, append=False):
+    with open(file, 'a' if append else 'w+') as f:
+        f.write(content)
+        f.flush()
+
+
+def load_file(file, default=None):
+    if not os.path.isfile(file):
+        return default
+    with open(file) as f:
+        result = f.read()
+    return result
+
+
+def cleanup(files=True, env=ENV_DEV, quiet=True):
+    if files:
+        cleanup_tmp_files()
+
+
+def cleanup_threads_and_processes(quiet=True):
+    for t in TMP_THREADS:
+        t.stop(quiet=quiet)
+
+
+def cleanup_tmp_files():
+    for tmp in TMP_FILES:
+        try:
+            if os.path.isdir(tmp):
+                run('rm -rf "%s"' % tmp)
+            else:
+                os.remove(tmp)
+        except Exception, e:
+            pass  # file likely doesn't exist, or permission denied
+    del TMP_FILES[:]
+
+
+def is_jar_archive(content):
+    # TODO Simple stupid heuristic to determine whether a file is a JAR archive
+    return 'KinesisEvent' in content and 'class' in content and 'META-INF' in content
+
+
+def cleanup_resources():
+    cleanup_tmp_files()
+    cleanup_threads_and_processes()
+
+
+def run(cmd, cache_duration_secs=0, print_error=True, async=False, stdin=False):
+    # don't use subprocess module as it is not thread-safe
+    # http://stackoverflow.com/questions/21194380/is-subprocess-popen-not-thread-safe
+    # import subprocess
+    import subprocess32 as subprocess
+
+    def do_run(cmd):
+        try:
+            if not async:
+                if stdin:
+                    return subprocess.check_output(cmd, shell=True,
+                        stderr=subprocess.STDOUT, stdin=subprocess.PIPE)
+                return subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT)
+            FNULL = open(os.devnull, 'w')
+            # subprocess.Popen is not thread-safe, hence use a mutex here..
+            mutex_popen.acquire()
+            if stdin:
+                process = subprocess.Popen(cmd, shell=True, stdin=subprocess.PIPE)
+            else:
+                process = subprocess.Popen(cmd, shell=True, stderr=subprocess.STDOUT,
+                    stdout=FNULL, stdin=subprocess.PIPE)
+            return process
+        except subprocess.CalledProcessError, e:
+            if print_error:
+                print("ERROR: '%s': %s" % (cmd, e.output))
+            raise e
+        finally:
+            mutex_popen.release()
+    if cache_duration_secs <= 0:
+        return do_run(cmd)
+    hash = md5(cmd)
+    cache_file = CACHE_FILE_PATTERN.replace('*', '%s') % hash
+    if os.path.isfile(cache_file):
+        # check file age
+        mod_time = os.path.getmtime(cache_file)
+        time_now = now()
+        if mod_time > (time_now - cache_duration_secs):
+            f = open(cache_file)
+            result = f.read()
+            f.close()
+            return result
+    # print("NO CACHED result available for (timeout %s): %s" % (cache_duration_secs,cmd))
+    result = do_run(cmd)
+    f = open(cache_file, 'w+')
+    f.write(result)
+    f.close()
+    clean_cache()
+    return result
+
+
+def clean_cache(file_pattern=CACHE_FILE_PATTERN,
+        last_clean_time=last_cache_clean_time, max_age=CACHE_MAX_AGE):
+    mutex_clean.acquire()
+    time_now = now()
+    try:
+        if last_clean_time['time'] > time_now - CACHE_CLEAN_TIMEOUT:
+            return
+        for cache_file in set(glob.glob(file_pattern)):
+            mod_time = os.path.getmtime(cache_file)
+            if time_now > mod_time + max_age:
+                sh.rm('-r', cache_file)
+        last_clean_time['time'] = time_now
+    finally:
+        mutex_clean.release()
+    return time_now
+
+
+def parallelize(func, list):
+    pool = Pool(len(list))
+    result = pool.map(func, list)
+    pool.close()
+    pool.join()
+    return result

@@ -1,23 +1,8 @@
-import json
-import logging
 import time
-from datetime import datetime
-
-from localstack.utils.time import timestamp_millis
-
-LOG = logging.getLogger(__name__)
-MAX_FUNCTION_ENVVAR_SIZE_BYTES = 4 * 1024
+import json
 
 
-class InvalidEnvVars(ValueError):
-    def __init__(self, envvars_string):
-        self.envvars_string = envvars_string
-
-    def __str__(self) -> str:
-        return self.envvars_string
-
-
-class Component:
+class Component(object):
     def __init__(self, id, env=None):
         self.id = id
         self.env = env
@@ -30,72 +15,68 @@ class Component:
         return self.__str__()
 
     def __str__(self):
-        return "<%s:%s>" % (self.__class__.__name__, self.id)
+        return '<%s:%s>' % (self.__class__.__name__, self.id)
 
 
 class KinesisStream(Component):
-    def __init__(self, id, params=None, num_shards=1, connection=None):
+    def __init__(self, id, params={}, num_shards=1, connection=None):
         super(KinesisStream, self).__init__(id)
-        params = params or {}
         self.shards = []
-        self.stream_name = params.get("name", self.name())
-        self.num_shards = params.get("shards", num_shards)
+        self.stream_name = params['name'] if 'name' in params else self.name()
+        self.num_shards = params['shards'] if 'shards' in params else num_shards
         self.conn = connection
         self.stream_info = params
 
     def name(self):
-        return self.id.split(":stream/")[-1]
+        return self.id.split(':stream/')[-1]
 
     def connect(self, connection):
         self.conn = connection
 
     def describe(self):
         r = self.conn.describe_stream(StreamName=self.stream_name)
-        return r.get("StreamDescription")
+        return r.get('StreamDescription')
 
     def create(self, raise_on_error=False):
         try:
             self.conn.create_stream(StreamName=self.stream_name, ShardCount=self.num_shards)
-        except Exception as e:
-            # TODO catch stream already exists exception, otherwise rethrow
+        except Exception, e:
             if raise_on_error:
                 raise e
 
     def get_status(self):
         description = self.describe()
-        return description.get("StreamStatus")
+        return description.get('StreamStatus')
 
     def put(self, data, key):
         if not isinstance(data, str):
             data = json.dumps(data)
-        return self.conn.put_record(StreamName=self.stream_name, Data=data, PartitionKey=key)
+        self.conn.put_record(StreamName=self.stream_name, Data=data, PartitionKey=key)
 
-    def read(self, amount=-1, shard="shardId-000000000001"):
-        if not self.conn:
-            raise Exception("Please create the Kinesis connection first.")
-        s_iterator = self.conn.get_shard_iterator(self.stream_name, shard, "TRIM_HORIZON")
-        record = self.conn.get_records(s_iterator["ShardIterator"])
+    def read(self, amount=-1, shard='shardId-000000000001'):
+        s_iterator = kinesis_conn.get_shard_iterator(self.stream_name, shard, 'TRIM_HORIZON')
+        record = kinesis_conn.get_records(s_iterator['ShardIterator'])
         while True:
             try:
-                if record["NextShardIterator"] is None:
+                if record['NextShardIterator'] is None:
                     break
                 else:
-                    next_entry = self.conn.get_records(record["NextShardIterator"])
-                    if len(next_entry["Records"]):
-                        print(next_entry["Records"][0]["Data"])
+                    next_entry = kinesis_conn.get_records(record['NextShardIterator'])
+                    if len(next_entry['Records']):
+                        print next_entry['Records'][0]['Data']
                     record = next_entry
-            except Exception as e:
-                print('Error reading from Kinesis stream "%s": %s' % (self.stream_name, e))
+            except:
+                print 'an exception has occured'
 
     def wait_for(self):
-        GET_STATUS_SLEEP_SECS = 5
+        GET_STATUS_SLEEP_SECS = 2
         GET_STATUS_RETRIES = 50
         for i in range(0, GET_STATUS_RETRIES):
             try:
                 status = self.get_status()
-                if status == "ACTIVE":
+                if status == 'ACTIVE':
                     return
-            except Exception:
+            except Exception, e:
                 # swallowing this exception should be ok, as we are in a retry loop
                 pass
             time.sleep(GET_STATUS_SLEEP_SECS)
@@ -103,7 +84,6 @@ class KinesisStream(Component):
 
     def destroy(self):
         self.conn.delete_stream(StreamName=self.stream_name)
-        time.sleep(2)
 
 
 class KinesisShard(Component):
@@ -116,44 +96,39 @@ class KinesisShard(Component):
         self.end_key = KinesisShard.MAX_KEY  # 128 times '1' binary as decimal
         self.child_shards = []
 
-    def print_tree(self, indent=""):
-        print("%s%s" % (indent, self))
+    def print_tree(self, indent=''):
+        print '%s%s' % (indent, self)
         for c in self.child_shards:
-            c.print_tree(indent=indent + "   ")
+            c.print_tree(indent=indent + '   ')
 
     def length(self):
-        return int(self.end_key) - int(self.start_key)
+        return long(self.end_key) - long(self.start_key)
 
     def percent(self):
         return 100.0 * self.length() / float(KinesisShard.MAX_KEY)
 
     def __str__(self):
-        return "Shard(%s, length=%s, percent=%s, start=%s, end=%s)" % (
-            self.id,
-            self.length(),
-            self.percent(),
-            self.start_key,
-            self.end_key,
-        )
+        return ('Shard(%s, length=%s, percent=%s, start=%s, end=%s)' %
+                (self.id, self.length(), self.percent(), self.start_key,
+                    self.end_key))
 
     @staticmethod
     def sort(shards):
         def compare(x, y):
-            s1 = int(x.start_key)
-            s2 = int(y.start_key)
+            s1 = long(x.start_key)
+            s2 = long(y.start_key)
             if s1 < s2:
                 return -1
             elif s1 > s2:
                 return 1
             else:
                 return 0
-
         return sorted(shards, cmp=compare)
 
     @staticmethod
     def max(shards):
         max_shard = None
-        max_length = int(0)
+        max_length = long(0)
         for s in shards:
             if s.length() > max_length:
                 max_shard = s
@@ -167,199 +142,20 @@ class FirehoseStream(KinesisStream):
         self.destinations = []
 
     def name(self):
-        return self.id.split(":deliverystream/")[-1]
-
-
-class CodeSigningConfig:
-    def __init__(self, arn, id, signing_profile_version_arns):
-        self.arn = arn
-        self.id = id
-        self.signing_profile_version_arns = signing_profile_version_arns
-        self.description = ""
-        self.untrusted_artifact_on_deployment = "Warn"
-        self.last_modified = None
+        return self.id.split(':deliverystream/')[-1]
 
 
 class LambdaFunction(Component):
-
-    QUALIFIER_LATEST: str = "$LATEST"
-
-    def __init__(self, arn):
-        super(LambdaFunction, self).__init__(arn)
+    def __init__(self, id):
+        super(LambdaFunction, self).__init__(id)
         self.event_sources = []
         self.targets = []
-        self.versions = {}
-        self.aliases = {}
-        self._envvars = {}
-        self.tags = {}
-        self.concurrency = None
-        self.runtime = None
-        self.handler = None
-        self.cwd = None
-        self.zip_dir = None
-        self.timeout = None
-        self.last_modified = None
-        self.vpc_config = None
-        self.role = None
-        self.kms_key_arn = None
-        self.memory_size = None
-        self.code = None
-        self.dead_letter_config = None
-        self.on_successful_invocation = None
-        self.on_failed_invocation = None
-        self.max_retry_attempts = None
-        self.max_event_age = None
-        self.description = ""
-        self.code_signing_config_arn = None
-        self.package_type = None
-        self.architectures = ["x86_64"]
-        self.image_config = {}
-        self.tracing_config = {}
-        self.state = None
-        self.url_config = None
-
-    def set_dead_letter_config(self, data):
-        config = data.get("DeadLetterConfig")
-        if not config:
-            return
-        self.dead_letter_config = config
-        target_arn = config.get("TargetArn") or ""
-        if ":sqs:" not in target_arn and ":sns:" not in target_arn:
-            raise Exception(
-                'Dead letter queue ARN "%s" requires a valid SQS queue or SNS topic' % target_arn
-            )
-
-    def get_function_event_invoke_config(self):
-        response = {}
-
-        if self.max_retry_attempts is not None:
-            response["MaximumRetryAttempts"] = self.max_retry_attempts
-        if self.max_event_age is not None:
-            response["MaximumEventAgeInSeconds"] = self.max_event_age
-        if self.on_successful_invocation or self.on_failed_invocation:
-            response["DestinationConfig"] = {}
-        if self.on_successful_invocation:
-            response["DestinationConfig"].update(
-                {"OnSuccess": {"Destination": self.on_successful_invocation}}
-            )
-        if self.on_failed_invocation:
-            response["DestinationConfig"].update(
-                {"OnFailure": {"Destination": self.on_failed_invocation}}
-            )
-        if not response:
-            return None
-        response.update(
-            {
-                "LastModified": timestamp_millis(self.last_modified),
-                "FunctionArn": str(self.id),
-            }
-        )
-        return response
-
-    def clear_function_event_invoke_config(self):
-        if hasattr(self, "dead_letter_config"):
-            self.dead_letter_config = None
-        if hasattr(self, "on_successful_invocation"):
-            self.on_successful_invocation = None
-        if hasattr(self, "on_failed_invocation"):
-            self.on_failed_invocation = None
-        if hasattr(self, "max_retry_attempts"):
-            self.max_retry_attempts = None
-        if hasattr(self, "max_event_age"):
-            self.max_event_age = None
-
-    def put_function_event_invoke_config(self, data):
-        if not isinstance(data, dict):
-            return
-
-        updated = False
-        if "DestinationConfig" in data:
-            if "OnFailure" in data["DestinationConfig"]:
-                dlq_arn = data["DestinationConfig"]["OnFailure"]["Destination"]
-                self.on_failed_invocation = dlq_arn
-                updated = True
-
-            if "OnSuccess" in data["DestinationConfig"]:
-                sq_arn = data["DestinationConfig"]["OnSuccess"]["Destination"]
-                self.on_successful_invocation = sq_arn
-                updated = True
-
-        if "MaximumRetryAttempts" in data:
-            try:
-                max_retry_attempts = int(data["MaximumRetryAttempts"])
-            except Exception:
-                max_retry_attempts = 3
-
-            self.max_retry_attempts = max_retry_attempts
-            updated = True
-
-        if "MaximumEventAgeInSeconds" in data:
-            try:
-                max_event_age = int(data["MaximumEventAgeInSeconds"])
-            except Exception:
-                max_event_age = 3600
-
-            self.max_event_age = max_event_age
-            updated = True
-
-        if updated:
-            self.last_modified = datetime.utcnow()
-
-        return self
-
-    def destination_enabled(self):
-        return self.on_successful_invocation is not None or self.on_failed_invocation is not None
-
-    def get_version(self, version):
-        return self.versions.get(version)
-
-    def max_version(self):
-        versions = [int(key) for key in self.versions.keys() if key != self.QUALIFIER_LATEST]
-        return versions and max(versions) or 0
 
     def name(self):
-        # Example ARN: arn:aws:lambda:aws-region:acct-id:function:helloworld:1
-        return self.id.split(":")[6]
-
-    def region(self):
-        return self.id.split(":")[3]
-
-    def arn(self):
-        return self.id
-
-    def get_qualifier_version(self, qualifier: str = None) -> str:
-        if not qualifier:
-            qualifier = self.QUALIFIER_LATEST
-        return (
-            qualifier
-            if qualifier in self.versions
-            else self.aliases.get(qualifier).get("FunctionVersion")
-        )
-
-    def qualifier_exists(self, qualifier):
-        return qualifier in self.aliases or qualifier in self.versions
-
-    @property
-    def envvars(self):
-        """Get the environment variables for the function.
-
-        When setting the environment variables, perform the following
-        validations:
-
-        - environment variables must be less than 4KiB in size
-        """
-        return self._envvars
-
-    @envvars.setter
-    def envvars(self, new_envvars):
-        encoded_envvars = json.dumps(new_envvars, separators=(",", ":"))
-        if len(encoded_envvars.encode("utf-8")) > MAX_FUNCTION_ENVVAR_SIZE_BYTES:
-            raise InvalidEnvVars(encoded_envvars)
-
-        self._envvars = new_envvars
+        return self.id.split(':function:')[-1]
 
     def __str__(self):
-        return "<%s:%s>" % (self.__class__.__name__, self.name())
+        return '<%s:%s>' % (self.__class__.__name__, self.name())
 
 
 class DynamoDB(Component):
@@ -369,28 +165,13 @@ class DynamoDB(Component):
         self.bytes = -1
 
     def name(self):
-        return self.id.split(":table/")[-1]
+        return self.id.split(':table/')[-1]
 
 
 class DynamoDBStream(Component):
     def __init__(self, id):
         super(DynamoDBStream, self).__init__(id)
-        self.table = None
-
-
-class DynamoDBItem(Component):
-    def __init__(self, id, table=None, keys=None):
-        super(DynamoDBItem, self).__init__(id)
-        self.table = table
-        self.keys = keys
-
-    def __eq__(self, other):
-        if not isinstance(other, DynamoDBItem):
-            return False
-        return other.table == self.table and other.id == self.id and other.keys == self.keys
-
-    def __hash__(self):
-        return hash(self.table) + hash(self.id) + hash(self.keys)
+        self.table = -1
 
 
 class ElasticSearch(Component):
@@ -400,23 +181,7 @@ class ElasticSearch(Component):
         self.endpoint = None
 
     def name(self):
-        return self.id.split(":domain/")[-1]
-
-
-class SqsQueue(Component):
-    def __init__(self, id):
-        super(SqsQueue, self).__init__(id)
-
-    def name(self):
-        return self.id.split(":")[-1]
-
-
-class SnsTopic(Component):
-    def __init__(self, id):
-        super(SnsTopic, self).__init__(id)
-
-    def name(self):
-        return self.id.split(":")[-1]
+        return self.id.split(':domain/')[-1]
 
 
 class S3Bucket(Component):
@@ -425,7 +190,7 @@ class S3Bucket(Component):
         self.notifications = []
 
     def name(self):
-        return self.id.split("arn:aws:s3:::")[-1]
+        return self.id.split('arn:aws:s3:::')[-1]
 
 
 class S3Notification(Component):
@@ -440,8 +205,7 @@ class EventSource(Component):
         super(EventSource, self).__init__(id)
 
     @staticmethod
-    def get(obj, pool=None, type=None):
-        pool = pool or {}
+    def get(obj, pool={}, type=None):
         if not obj:
             return None
         if isinstance(obj, Component):
@@ -449,22 +213,18 @@ class EventSource(Component):
         if obj in pool:
             return pool[obj]
         inst = None
-        if obj.startswith("arn:aws:kinesis:"):
+        if obj.startswith('arn:aws:kinesis:'):
             inst = KinesisStream(obj)
-        elif obj.startswith("arn:aws:lambda:"):
+        if obj.startswith('arn:aws:lambda:'):
             inst = LambdaFunction(obj)
-        elif obj.startswith("arn:aws:dynamodb:"):
-            if "/stream/" in obj:
-                table_id = obj.split("/stream/")[0]
+        elif obj.startswith('arn:aws:dynamodb:'):
+            if '/stream/' in obj:
+                table_id = obj.split('/stream/')[0]
                 table = DynamoDB(table_id)
                 inst = DynamoDBStream(obj)
                 inst.table = table
             else:
                 inst = DynamoDB(obj)
-        elif obj.startswith("arn:aws:sqs:"):
-            inst = SqsQueue(obj)
-        elif obj.startswith("arn:aws:sns:"):
-            inst = SnsTopic(obj)
         elif type:
             for o in EventSource.filter_type(pool, type):
                 if o.name() == obj:
@@ -473,9 +233,13 @@ class EventSource(Component):
                     if o.endpoint == obj:
                         return o
         else:
-            print("Unexpected object name: '%s'" % obj)
+            print("Unexpected object name! %s" % obj)
         return inst
 
     @staticmethod
     def filter_type(pool, type):
-        return [obj for obj in pool.values() if isinstance(obj, type)]
+        result = []
+        for key, obj in pool.iteritems():
+            if isinstance(obj, type):
+                result.append(obj)
+        return result

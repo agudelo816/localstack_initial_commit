@@ -1,77 +1,28 @@
-import json
-import logging
 import os
-import re
-import socket
-import threading
-from functools import lru_cache
-from typing import Dict, Optional, Union
-
 import boto3
-import botocore
-import botocore.config
+import airspeed
+import requests
+import json
+import base64
+import logging
+from elasticsearch import Elasticsearch
+from jsonpath_rw import jsonpath, parse
+from localstack.constants import *
+from localstack.utils.common import *
+from localstack.utils.aws.aws_models import *
 
-from localstack import config
-from localstack.aws.accounts import get_aws_access_key_id, get_aws_account_id
-from localstack.constants import (
-    APPLICATION_AMZ_JSON_1_0,
-    APPLICATION_AMZ_JSON_1_1,
-    APPLICATION_X_WWW_FORM_URLENCODED,
-    ENV_DEV,
-    HEADER_LOCALSTACK_ACCOUNT_ID,
-    LOCALHOST,
-    MAX_POOL_CONNECTIONS,
-    REGION_LOCAL,
-    S3_VIRTUAL_HOSTNAME,
-    TEST_AWS_ACCESS_KEY_ID,
-    TEST_AWS_SECRET_ACCESS_KEY,
-)
-from localstack.utils.http import make_http_request
-from localstack.utils.strings import is_string, is_string_or_bytes, to_str
+# file to override environment information (used mainly for testing Lambdas locally)
+ENVIRONMENT_FILE = '.env.properties'
 
 # set up logger
-LOG = logging.getLogger(__name__)
-
-# cache local region
-LOCAL_REGION = None
-
-# Use this flag to enable creation of a new session for each boto3 connection.
-CREATE_NEW_SESSION_PER_BOTO3_CONNECTION = False
-
-# Used in AWS assume role function
-INITIAL_BOTO3_SESSION = None
-
-# Boto clients cache
-BOTO_CLIENTS_CACHE = {}
-
-# cached value used to determine the DNS status of the S3 hostname (whether it can be resolved properly)
-CACHE_S3_HOSTNAME_DNS_STATUS = None
-
-# mutex used when creating boto clients (which isn't thread safe: https://github.com/boto/boto3/issues/801)
-BOTO_CLIENT_CREATE_LOCK = threading.RLock()
+LOGGER = logging.getLogger(__name__)
 
 
-@lru_cache()
-def get_valid_regions():
-    valid_regions = set()
-    for partition in set(boto3.Session().get_available_partitions()):
-        for region in boto3.Session().get_available_regions("sns", partition):
-            valid_regions.add(region)
-    return valid_regions
-
-
-def get_valid_regions_for_service(service_name):
-    regions = list(boto3.Session().get_available_regions(service_name))
-    regions.extend(boto3.Session().get_available_regions("cloudwatch", partition_name="aws-us-gov"))
-    regions.extend(boto3.Session().get_available_regions("cloudwatch", partition_name="aws-cn"))
-    return regions
-
-
-class Environment:
+class Environment(object):
     def __init__(self, region=None, prefix=None):
         # target is the runtime environment to use, e.g.,
         # 'local' for local mode
-        self.region = region or get_local_region()
+        self.region = region or DEFAULT_REGION
         # prefix can be 'prod', 'stg', 'uat-1', etc.
         self.prefix = prefix
 
@@ -82,11 +33,11 @@ class Environment:
 
     @staticmethod
     def from_string(s):
-        parts = s.split(":")
+        parts = s.split(':')
         if len(parts) == 1:
             if s in PREDEFINED_ENVIRONMENTS:
                 return PREDEFINED_ENVIRONMENTS[s]
-            parts = [get_local_region(), s]
+            parts = [DEFAULT_REGION, s]
         if len(parts) > 2:
             raise Exception('Invalid environment string "%s"' % s)
         region = parts[0]
@@ -95,17 +46,29 @@ class Environment:
 
     @staticmethod
     def from_json(j):
-        if not isinstance(j, dict):
+        if not isinstance(obj, dict):
             j = j.to_dict()
         result = Environment()
         result.apply_json(j)
         return result
 
     def __str__(self):
-        return "%s:%s" % (self.region, self.prefix)
+        return '%s:%s' % (self.region, self.prefix)
 
 
-PREDEFINED_ENVIRONMENTS = {ENV_DEV: Environment(region=REGION_LOCAL, prefix=ENV_DEV)}
+PREDEFINED_ENVIRONMENTS = {
+    ENV_DEV: Environment(region=REGION_LOCAL, prefix=ENV_DEV)
+}
+
+
+def create_environment_file(env, fallback_to_environ=True):
+    try:
+        save_file(ENVIRONMENT_FILE, env)
+    except Exception, e:
+        LOGGER.warning('Unable to create file "%s" in CWD "%s" (setting $ENV instead: %s): %s' %
+            (ENVIRONMENT_FILE, os.getcwd(), fallback_to_environ, e))
+        if fallback_to_environ:
+            os.environ['ENV'] = env
 
 
 def get_environment(env=None, region_name=None):
@@ -121,13 +84,24 @@ def get_environment(env=None, region_name=None):
 
     Additionally, parameter `region_name` can be used to override DEFAULT_REGION.
     """
+    if os.path.isfile(ENVIRONMENT_FILE):
+        try:
+            env = load_file(ENVIRONMENT_FILE)
+            env = env.strip() if env else env
+        except Exception, e:
+            # We can safely swallow this exception. In some rare cases, os.environ['ENV'] may
+            # be changed by a parallel thread executing a Lambda code. This can only happen when
+            # running in the local dev/test environment, hence is not critical for prod usage.
+            # If reading the file was unsuccessful, we fall back to ENV_DEV and continue below.
+            pass
+
     if not env:
-        if "ENV" in os.environ:
-            env = os.environ["ENV"]
+        if 'ENV' in os.environ:
+            env = os.environ['ENV']
         else:
             env = ENV_DEV
     elif not is_string(env) and not isinstance(env, Environment):
-        raise Exception("Invalid environment: %s" % env)
+        raise Exception('Invalid environment: %s' % env)
 
     if is_string(env):
         env = Environment.from_string(env)
@@ -138,375 +112,166 @@ def get_environment(env=None, region_name=None):
     return env
 
 
-def is_local_env(env):
-    return not env or env.region == REGION_LOCAL or env.prefix == ENV_DEV
-
-
-class Boto3Session(boto3.session.Session):
-    """Custom boto3 session that points to local endpoint URLs."""
-
-    def resource(self, service, *args, **kwargs):
-        self._fix_endpoint(kwargs)
-        return connect_to_resource(service, *args, **kwargs)
-
-    def client(self, service, *args, **kwargs):
-        self._fix_endpoint(kwargs)
-        return connect_to_service(service, *args, **kwargs)
-
-    def _fix_endpoint(self, kwargs):
-        if "amazonaws.com" in kwargs.get("endpoint_url", ""):
-            kwargs.pop("endpoint_url")
-
-
-def get_boto3_session(cache=True):
-    if not cache or CREATE_NEW_SESSION_PER_BOTO3_CONNECTION:
-        return boto3.session.Session()
-    # return default session
-    return boto3
-
-
-def get_region():
-    # Note: leave import here to avoid import errors (e.g., "flask") for CLI commands
-    from localstack.utils.aws.request_context import get_region_from_request_context
-
-    region = get_region_from_request_context()
-    if region:
-        return region
-    # fall back to returning static pre-defined region
-    return get_local_region()
-
-
-def get_partition(region_name: str = None):
-    region_name = region_name or get_region()
-    return boto3.session.Session().get_partition_for_region(region_name)
-
-
-def get_local_region():
-    global LOCAL_REGION
-    if LOCAL_REGION is None:
-        LOCAL_REGION = get_boto3_region() or ""
-    return config.DEFAULT_REGION or LOCAL_REGION
-
-
-def get_boto3_region() -> str:
-    """Return the region name, as determined from the environment when creating a new boto3 session"""
-    return boto3.session.Session().region_name
-
-
-def is_internal_call_context(headers):
-    """Return whether we are executing in the context of an internal API call, i.e.,
-    the case where one API uses a boto3 client to call another API internally."""
-    return HEADER_LOCALSTACK_ACCOUNT_ID in headers.keys()
-
-
-def get_local_service_url(service_name_or_port: Union[str, int]) -> str:
-    """Return the local service URL for the given service name or port."""
-    if isinstance(service_name_or_port, int):
-        return f"{config.get_protocol()}://{LOCALHOST}:{service_name_or_port}"
-    service_name = service_name_or_port
-    if service_name == "s3api":
-        service_name = "s3"
-    elif service_name == "runtime.sagemaker":
-        service_name = "sagemaker-runtime"
-    return config.service_url(service_name)
-
-
-def connect_to_resource(
-    service_name, env=None, region_name=None, endpoint_url=None, *args, **kwargs
-):
+def connect_to_resource(service_name, env=None, region_name=None, endpoint_url=None):
     """
     Generic method to obtain an AWS service resource using boto3, based on environment, region, or custom endpoint_url.
     """
-    return connect_to_service(
-        service_name,
-        client=False,
-        env=env,
-        region_name=region_name,
-        endpoint_url=endpoint_url,
-        *args,
-        **kwargs,
-    )
+    return connect_to_service(service_name, client=False, env=env, region_name=region_name, endpoint_url=endpoint_url)
 
 
-def connect_to_resource_external(
-    service_name,
-    env=None,
-    region_name=None,
-    endpoint_url=None,
-    config: botocore.config.Config = None,
-    **kwargs,
-):
-    """
-    Generic method to obtain an AWS service resource using boto3, based on environment, region, or custom endpoint_url.
-    """
-    return create_external_boto_client(
-        service_name,
-        client=False,
-        env=env,
-        region_name=region_name,
-        endpoint_url=endpoint_url,
-        config=config,
-    )
-
-
-def connect_to_service(
-    service_name,
-    client=True,
-    env=None,
-    region_name=None,
-    endpoint_url=None,
-    config: botocore.config.Config = None,
-    verify=False,
-    cache=True,
-    internal=True,
-    *args,
-    **kwargs,
-):
+def connect_to_service(service_name, client=True, env=None, region_name=None, endpoint_url=None):
     """
     Generic method to obtain an AWS service client using boto3, based on environment, region, or custom endpoint_url.
     """
-    # determine context and create cache key
-    region_name = region_name or get_region()
     env = get_environment(env, region_name=region_name)
-    region = env.region if env.region != REGION_LOCAL else region_name
-    key_elements = [service_name, client, env, region, endpoint_url, config, internal, kwargs]
-    cache_key = "/".join([str(k) for k in key_elements])
-
-    # check cache first (most calls will be served from cache)
-    if cache and cache_key in BOTO_CLIENTS_CACHE:
-        return BOTO_CLIENTS_CACHE[cache_key]
-
-    with BOTO_CLIENT_CREATE_LOCK:
-        # check cache again within lock context to avoid race conditions
-        if cache and cache_key in BOTO_CLIENTS_CACHE:
-            return BOTO_CLIENTS_CACHE[cache_key]
-
-        # determine endpoint_url if it is not set explicitly
-        if not endpoint_url:
-            if is_local_env(env):
-                endpoint_url = get_local_service_url(service_name)
-                verify = False
-            backend_env_name = "%s_BACKEND" % service_name.upper()
-            backend_url = os.environ.get(backend_env_name, "").strip()
-            if backend_url:
-                endpoint_url = backend_url
-
-        # configure S3 path/host style addressing
-        if service_name == "s3":
-            if re.match(r"https?://localhost(:[0-9]+)?", endpoint_url):
-                endpoint_url = endpoint_url.replace("://localhost", "://%s" % get_s3_hostname())
-
-        # create boto client or resource from potentially cached session
-        boto_session = get_boto3_session(cache=cache)
-        boto_config = config or botocore.client.Config()
-        boto_factory = boto_session.client if client else boto_session.resource
-
-        # To, prevent error "Connection pool is full, discarding connection ...",
-        # set the environment variable MAX_POOL_CONNECTIONS. Default is 150.
-        boto_config.max_pool_connections = MAX_POOL_CONNECTIONS
-
-        new_client = boto_factory(
-            service_name,
-            region_name=region,
-            endpoint_url=endpoint_url,
-            verify=verify,
-            config=boto_config,
-            **kwargs,
-        )
-
-        # We set a custom header in all internal calls which help LocalStack
-        # identify requests as such
-        if client and internal:
-
-            def _add_internal_header(request, **kwargs):
-                request.headers.add_header(HEADER_LOCALSTACK_ACCOUNT_ID, get_aws_account_id())
-
-            event_system = new_client.meta.events
-            event_system.register_first("before-sign.*.*", _add_internal_header)
-
-        if cache:
-            BOTO_CLIENTS_CACHE[cache_key] = new_client
-
-        return new_client
+    method = boto3.client if client else boto3.resource
+    if not endpoint_url:
+        if env.region == REGION_LOCAL:
+            endpoint_url = os.environ['TEST_%s_URL' % (service_name.upper())]
+    return method(service_name, region_name=env.region, endpoint_url=endpoint_url)
 
 
-def create_external_boto_client(
-    service_name,
-    client=True,
-    env=None,
-    region_name=None,
-    endpoint_url=None,
-    config: botocore.config.Config = None,
-    verify=False,
-    cache=True,
-    aws_access_key_id=None,
-    *args,
-    **kwargs,
-):
-    # Currently we use the Access Key ID field to specify the AWS account ID; this will change when IAM matures.
-    # It is important that the correct Account ID is included in the request as that will determine access to namespaced resources.
-    if aws_access_key_id is None:
-        aws_access_key_id = get_aws_account_id()
+class VelocityInput:
+    """Simple class to mimick the behavior of variable '$input' in AWS API Gateway integration velocity templates.
+    See: http://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-mapping-template-reference.html"""
+    def __init__(self, value):
+        self.value = value
 
-    return connect_to_service(
-        service_name,
-        client,
-        env,
-        region_name,
-        endpoint_url,
-        config,
-        verify,
-        cache,
-        internal=False,
-        aws_access_key_id=aws_access_key_id,
-        aws_secret_access_key="__test_key__",
-        *args,
-        **kwargs,
-    )
+    def path(self, path):
+        value = self.value if isinstance(self.value, dict) else json.loads(self.value)
+        jsonpath_expr = parse(path)
+        result = [match.value for match in jsonpath_expr.find(value)]
+        result = result[0] if len(result) == 1 else result
+        return result
+
+    def json(self, path):
+        return json.dumps(self.path(path))
 
 
-def get_s3_hostname():
-    global CACHE_S3_HOSTNAME_DNS_STATUS
-    if CACHE_S3_HOSTNAME_DNS_STATUS is None:
-        try:
-            assert socket.gethostbyname(S3_VIRTUAL_HOSTNAME)
-            CACHE_S3_HOSTNAME_DNS_STATUS = True
-        except socket.error:
-            CACHE_S3_HOSTNAME_DNS_STATUS = False
-    if CACHE_S3_HOSTNAME_DNS_STATUS:
-        return S3_VIRTUAL_HOSTNAME
-    return LOCALHOST
+class VelocityUtil:
+    """Simple class to mimick the behavior of variable '$util' in AWS API Gateway integration velocity templates.
+    See: http://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-mapping-template-reference.html"""
+    def base64Encode(self, s):
+        if not isinstance(s, str):
+            s = json.dumps(s)
+        return base64.b64encode(s)
+
+    def base64Decode(self, s):
+        if not isinstance(s, str):
+            s = json.dumps(s)
+        return base64.b64decode(s)
 
 
-def generate_presigned_url(*args, **kwargs):
-    endpoint_url = kwargs.pop("endpoint_url", None)
-    s3_client = connect_to_service(
-        "s3",
-        endpoint_url=endpoint_url,
-        cache=False,
-        # Note: presigned URL needs to be created with (external) test credentials
-        aws_access_key_id=TEST_AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=TEST_AWS_SECRET_ACCESS_KEY,
-    )
-    return s3_client.generate_presigned_url(*args, **kwargs)
-
-
-def set_default_region_in_headers(headers, service=None, region=None):
-    # this should now be a no-op, as we support arbitrary regions and don't use a "default" region
-    # TODO: remove this function once the legacy USE_SINGLE_REGION config is removed
-    if not config.USE_SINGLE_REGION:
-        return
-
-    auth_header = headers.get("Authorization")
-    region = region or get_region()
-    if not auth_header:
-        if service:
-            headers["Authorization"] = mock_aws_request_headers(service, region_name=region)[
-                "Authorization"
-            ]
-        return
-    replaced = re.sub(r"(.*Credential=[^/]+/[^/]+/)([^/])+/", r"\1%s/" % region, auth_header)
-    headers["Authorization"] = replaced
-
-
-def fix_account_id_in_arns(response, colon_delimiter=":", existing=None, replace=None):
-    """Fix the account ID in the ARNs returned in the given Flask response or string"""
-    existing = existing or ["123456789", "1234567890", "123456789012", get_aws_account_id()]
-    existing = existing if isinstance(existing, list) else [existing]
-    replace = replace or get_aws_account_id()
-    is_str_obj = is_string_or_bytes(response)
-    content = to_str(response if is_str_obj else response._content)
-
-    replace = r"arn{col}aws{col}\1{col}\2{col}{acc}{col}".format(col=colon_delimiter, acc=replace)
-    for acc_id in existing:
-        regex = r"arn{col}aws{col}([^:%]+){col}([^:%]*){col}{acc}{col}".format(
-            col=colon_delimiter, acc=acc_id
-        )
-        content = re.sub(regex, replace, content)
-
-    if not is_str_obj:
-        response._content = content
-        response.headers["Content-Length"] = len(response._content)
-        return response
-    return content
-
-
-def inject_test_credentials_into_env(env):
-    if "AWS_ACCESS_KEY_ID" not in env and "AWS_SECRET_ACCESS_KEY" not in env:
-        env["AWS_ACCESS_KEY_ID"] = "test"
-        env["AWS_SECRET_ACCESS_KEY"] = "test"
-
-
-# TODO: remove
-def inject_region_into_env(env, region):
-    env["AWS_REGION"] = region
-
-
-def extract_region_from_auth_header(headers: Dict[str, str], use_default=True) -> str:
-    auth = headers.get("Authorization") or ""
-    region = re.sub(r".*Credential=[^/]+/[^/]+/([^/]+)/.*", r"\1", auth)
-    if region == auth:
-        region = None
-    if use_default:
-        region = region or get_region()
-    return region
-
-
-def extract_access_key_id_from_auth_header(headers: Dict[str, str]) -> Optional[str]:
-    auth = headers.get("Authorization") or ""
-
-    if auth.startswith("AWS4-"):
-        # For Signature Version 4
-        access_id = re.findall(r".*Credential=([^/]+)/[^/]+/[^/]+/.*", auth)
-        if len(access_id):
-            return access_id[0]
-
-    elif auth.startswith("AWS "):
-        # For Signature Version 2
-        access_id = auth.removeprefix("AWS ").split(":")
-        if len(access_id):
-            return access_id[0]
-
-
-def mock_aws_request_headers(
-    service="dynamodb", region_name=None, access_key=None, internal=False
-) -> Dict[str, str]:
-    ctype = APPLICATION_AMZ_JSON_1_0
-    if service == "kinesis":
-        ctype = APPLICATION_AMZ_JSON_1_1
-    elif service in ["sns", "sqs", "sts", "cloudformation"]:
-        ctype = APPLICATION_X_WWW_FORM_URLENCODED
-
-    # For S3 presigned URLs, we require that the client and server use the same
-    # access key ID to sign requests. So try to use the access key ID for the
-    # current request if available
-    access_key = access_key or get_aws_access_key_id()
-    region_name = region_name or get_region()
-    headers = {
-        "Content-Type": ctype,
-        "Accept-Encoding": "identity",
-        "X-Amz-Date": "20160623T103251Z",
-        "Authorization": (
-            "AWS4-HMAC-SHA256 "
-            + f"Credential={access_key}/20160623/{region_name}/{service}/aws4_request, "
-            + "SignedHeaders=content-type;host;x-amz-date;x-amz-target, Signature=1234"
-        ),
+def render_velocity_template(template, context, as_json=False):
+    t = airspeed.Template(template)
+    variables = {
+        'input': VelocityInput(context),
+        'util': VelocityUtil()
     }
-    if internal:
-        headers[HEADER_LOCALSTACK_ACCOUNT_ID] = get_aws_account_id()
+    replaced = t.merge(variables)
+    if as_json:
+        replaced = json.loads(replaced)
+    return replaced
+
+
+def dynamodb_table_arn(table_name):
+    return "arn:aws:dynamodb:%s:%s:table/%s" % (DEFAULT_REGION, TEST_AWS_ACCOUNT_ID, table_name)
+
+
+def dynamodb_stream_arn(table_name):
+    return ("arn:aws:dynamodb:%s:%s:table/%s/stream/%s" %
+        (DEFAULT_REGION, TEST_AWS_ACCOUNT_ID, table_name, timestamp()))
+
+
+def lambda_function_arn(function_name, account_id=TEST_AWS_ACCOUNT_ID, env=None):
+    env = get_environment(env)
+    return "arn:aws:lambda:%s:%s:function:%s" % (DEFAULT_REGION, account_id, function_name)
+
+
+def kinesis_stream_arn(stream_name, account_id=TEST_AWS_ACCOUNT_ID, env=None):
+    env = get_environment(env)
+    return "arn:aws:kinesis:%s:%s:stream/%s" % (DEFAULT_REGION, account_id, stream_name)
+
+
+def dynamodb_get_item_raw(dynamodb_url, request):
+    headers = mock_aws_request_headers()
+    headers['X-Amz-Target'] = 'DynamoDB_20120810.GetItem'
+    new_item = requests.post(dynamodb_url, data=json.dumps(request), headers=headers)
+    new_item = json.loads(new_item.text)
+    return new_item
+
+
+def mock_aws_request_headers(service='dynamodb'):
+    ctype = APPLICATION_AMZ_JSON_1_0
+    if service == 'kinesis':
+        ctype = APPLICATION_AMZ_JSON_1_1
+    headers = {
+        'Content-Type': ctype,
+        'Accept-Encoding': 'identity',
+        'X-Amz-Date': '20160623T103251Z',
+        'Authorization': ('AWS4-HMAC-SHA256 ' +
+            'Credential=ABC/20160623/us-east-1/%s/aws4_request, ' +
+            'SignedHeaders=content-type;host;x-amz-date;x-amz-target, Signature=1234') % service
+    }
     return headers
 
 
-# TODO: is this still useful?
-def dynamodb_get_item_raw(request):
-    headers = mock_aws_request_headers()
-    headers["X-Amz-Target"] = "DynamoDB_20120810.GetItem"
-    new_item = make_http_request(
-        url=config.service_url("dynamodb"),
-        method="POST",
-        data=json.dumps(request),
-        headers=headers,
+def get_apigateway_integration(api_id, method, path, env=None):
+    apigateway = connect_to_service(service_name='apigateway', client=True, env=env)
+
+    resources = apigateway.get_resources(
+        restApiId=api_id,
+        limit=100
     )
-    new_item = new_item.text
-    new_item = new_item and json.loads(new_item)
-    return new_item
+    resource_id = None
+    for r in resources['items']:
+        if r['path'] == path:
+            resource_id = r['id']
+    if not resource_id:
+        raise Exception('Unable to find apigateway integration for path "%s"' % path)
+
+    integration = apigateway.get_integration(
+        restApiId=api_id,
+        resourceId=resource_id,
+        httpMethod=method
+    )
+    return integration
+
+
+def connect_elasticsearch():
+    es = Elasticsearch([{
+        'host': LOCALHOST,
+        'port': DEFAULT_PORT_ELASTICSEARCH}])
+    return es
+
+
+def delete_all_elasticsearch_indices(endpoint=None, env=None):
+    """
+    This function drops ALL indexes in Elasticsearch. Handle with care!
+    """
+    env = aws_util.get_environment(env)
+    if env.region != REGION_LOCAL:
+        raise Exception('Refusing to delete ALL Elasticsearch indices outside of local dev environment.')
+    indices = aws_util.elasticsearch_get_indices(endpoint=endpoint, env=env)
+    for index in indices:
+        aws_util.elasticsearch_delete_index(index, endpoint=endpoint, env=env)
+
+
+def delete_all_elasticsearch_data():
+    """
+    This function drops ALL data in the local Elasticsearch data folder. Handle with care!
+    """
+    data_dir = os.path.join(LOCALSTACK_ROOT_FOLDER, 'infra', 'elasticsearch', 'data', 'elasticsearch', 'nodes')
+    run('rm -rf "%s"' % data_dir)
+
+
+def create_kinesis_stream(stream_name, shards=1, env=None):
+    env = get_environment(env)
+    # stream
+    stream = KinesisStream(id=stream_name, num_shards=shards)
+    # producer
+    conn = connect_to_service('kinesis', env=env)
+    stream.connect(conn)
+    stream.create()
+    stream.wait_for()
+    return stream
